@@ -1,0 +1,6 @@
+[project]
+name = "env-cv"
+version = "0"
+description = "OpenCV for the rotate step"
+requires-python = "==3.12.*"
+dependencies = ["opencv-python-headless>=4.10"]

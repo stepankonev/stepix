@@ -1,0 +1,20 @@
+name: Tests
+
+on: push
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # this action publishes full version tags only
+      - run: uv run --python ${{ matrix.python }} pytest
+      - run: uvx --python ${{ matrix.python }} --from . stepix run ./README.md
