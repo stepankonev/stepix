@@ -1,6 +1,6 @@
 [project]
 name = "stepix"
-version = "0.1.0"
+version = "0.2.0"
 description = "Makes the setup instructions in your README exact and runnable"
 readme = "README.md"
 license = "MIT"

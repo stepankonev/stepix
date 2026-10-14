@@ -4,7 +4,7 @@ Steps return values to later steps with `output()`. This file needs only the sta
 stepix copies it into every step's PYTHONPATH, so steps can import it without installing stepix.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def output(**values: object) -> None:
