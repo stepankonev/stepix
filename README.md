@@ -2,6 +2,8 @@
 
 **stepix makes the setup instructions in your README exact and runnable.**
 
+![Running this README twice: the download is cached the second time](https://raw.githubusercontent.com/stepankonev/stepix/main/docs/demo.svg)
+
 ## The problem
 
 Research repos often ship their setup as a README ritual: install this, download that,
