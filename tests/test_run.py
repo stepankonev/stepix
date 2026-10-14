@@ -1,5 +1,6 @@
 """Running pipelines: what reruns and why, --step, --from and --no-cache, outputs, failures."""
 
+import io
 import json
 import re
 import signal
@@ -196,3 +197,28 @@ def test_output_helper_works_in_any_step(project):
         step("use", requires=("make",),
              run="echo {steps.make.angle}-{steps.make.name} >> ran.txt")))
     assert project.stepix("run").code == 0 and project.ran() == ["30-x", "y"]
+
+
+def test_the_terminal_view_draws_boxes_and_the_values_between_them(project):
+    from rich.console import Console
+
+    from stepix.flow import Flow
+    from stepix.spec import load
+    from stepix.store import now
+
+    readme = project.write("README.md", pipeline(
+        "P", step("a", run="echo ::stepix::output x=1"),
+        step("b", requires=("a",), run="echo {steps.a.x}"), step("c", requires=("a",))))
+    pipe, _ = load(str(readme))
+    items = {"a": {"state": "done", "duration_s": 42},
+             "b": {"state": "running", "started_at": now()}, "c": {"state": "pending"}}
+    console = Console(record=True, width=90, height=100, file=io.StringIO())
+    console.print(Flow(pipe, ["a", "b", "c"], items))
+    lines = console.export_text().splitlines()
+    text = "\n".join(lines)
+    for part in ("✓ a", "done 0:42", "$ echo ::stepix::output x=1", "● x", "to b",  # a hands x on
+                 "running 0:0", "▶ x", "from a", "$ echo {steps.a.x}",  # b uses it
+                 "· c", "waiting", "repo env", "✓ 1 done", "· 1 waiting"):
+        assert part in text, part
+    top_of_c = next(line for line in lines if "· c" in line)
+    assert "▶╭" in top_of_c  # c only requires a: the line goes box to box
