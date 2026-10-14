@@ -5,25 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from rich.console import Console, Group
+from rich.console import Console
 from rich.live import Live
-from rich.rule import Rule
-from rich.spinner import Spinner
-from rich.table import Table
 from rich.text import Text
 
-from .store import seconds_since
+from .flow import Flow, clock
 
 console = Console(highlight=False, soft_wrap=True)
-STYLE = {"pending": ("·", "grey50"), "running": ("", "blue"), "done": ("✓", "green"),
-         "cached": ("✓", "dim green"), "failed": ("✗", "red"), "warned": ("!", "yellow"),
-         "skipped": ("-", "grey50")}
-
-
-def clock(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def when(stamp: str | None) -> str:
@@ -32,33 +20,6 @@ def when(stamp: str | None) -> str:
         return ""
     local = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone()
     return local.strftime("%Y-%m-%d %H:%M")
-
-
-class StepTable:
-    """The per-step view. Rendered fresh on every refresh, so spinners and clocks move."""
-
-    def __init__(self, title: str, items: list[dict[str, Any]], notes: bool = False) -> None:
-        self.title, self.items, self.notes = title, items, notes
-
-    def __rich__(self) -> Group:
-        grid = Table.grid(padding=(0, 1))
-        for column in (1, 16, 10, 0):
-            grid.add_column(min_width=column)
-        for item in self.items:
-            state = item["state"]
-            icon, style = STYLE.get(state, ("?", ""))
-            if state == "running" and item.get("started_at"):
-                item["elapsed_s"] = seconds_since(item["started_at"])
-            mark = Spinner("dots", style="blue") if state == "running" else Text(icon, style=style)
-            took = item.get("elapsed_s") if state == "running" else item.get("duration_s")
-            label = clock(took) if took is not None and state in ("running", "done") else (
-                "" if state == "pending" else state)
-            note = item.get("reason") if state not in ("done", "cached") else None
-            if self.notes and item.get("last_run_at"):
-                note = f"last ran {when(item['last_run_at'])}" + (f"; {note}" if note else "")
-            grid.add_row(mark, Text(item["step"], style=style), Text(label, style=style),
-                         Text(note or "" if self.notes else "", style="grey50"))
-        return Group(Rule(Text(f"{self.title} ", style="bold"), align="left", style="grey50"), grid)
 
 
 class PlainView:
@@ -84,7 +45,8 @@ class PlainView:
 
 
 class LiveView:
-    """A terminal: the live step table, with the running step's output streaming above it."""
+    """A terminal: the steps as boxes with lines between them, live, and the running step's
+    output streaming above."""
 
     def __init__(self) -> None:
         self.items: dict[str, dict[str, Any]] = {}
@@ -93,8 +55,8 @@ class LiveView:
     def start(self, plan: Any, logs: str) -> None:
         console.print(Text(f"logs: {logs}", style="grey50"))
         self.items = {s: {"step": s, "state": "pending"} for s in plan.selected}
-        self.live = Live(StepTable(plan.pipe.name, list(self.items.values()), notes=True),
-                         console=console, refresh_per_second=8)
+        self.live = Live(Flow(plan.pipe, plan.selected, self.items), console=console,
+                         refresh_per_second=8)
         self.live.start()
 
     def update(self, sid: str, info: dict[str, Any]) -> None:
