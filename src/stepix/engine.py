@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import os
 import platform
+import queue
 import re
 import shlex
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -189,7 +191,9 @@ def _rel(root: Path, path: Path) -> str:
 
 
 class Execution:
-    """One run: executes the plan step by step, keeping state.json and the receipt current."""
+    """One run: starts each step once the steps it requires have finished, so steps that don't
+    depend on each other run at the same time, each in its own thread. Keeps state.json and the
+    receipt current."""
 
     def __init__(self, plan: Plan, store: Store, view: View) -> None:
         self.plan, self.store, self.view = plan, store, view
@@ -199,6 +203,10 @@ class Execution:
         self.live: dict[str, dict[str, Any]] = {s: {"state": "pending"} for s in plan.selected}
         self.details: dict[str, dict[str, Any]] = {}
         self.failures: list[dict[str, Any]] = []
+        self.lock = threading.RLock()  # state, details and failures change from every thread
+        self.cancel = threading.Event()  # set: the commands still running are interrupted
+        self.threads: list[threading.Thread] = []
+        self.finished: queue.Queue[str | BaseException | None] = queue.Queue()
         for sid in plan.selected:  # if this run stops early, these still run next time
             entry = plan.pstate["steps"].get(sid) or {}
             if plan.reasons[sid] and entry.get("last_state") == "done":
@@ -218,30 +226,22 @@ class Execution:
         write_json(self.run_dir / "manifest.json", self.manifest)
 
     def set_state(self, sid: str, state: str, **info: Any) -> None:
-        self.live[sid].update(state=state, **info)
-        self.view.update(sid, self.live[sid])
-        self.save()
+        with self.lock:
+            self.live[sid].update(state=state, **info)
+            self.view.update(sid, self.live[sid])
+            self.save()
 
     def run(self) -> RunResult:
         plan, code = self.plan, OK
         self.save()
         self.view.start(plan, _rel(self.root, self.run_dir / "logs" / "<step>.log"))
         try:
-            stopped = False
-            for sid in plan.selected:
-                step = plan.pipe.steps[sid]
-                broken = [n for n in step.requires  # steps outside this run succeeded before
-                          if self.live.get(n, {}).get("state") in ("failed", "skipped")]
-                if broken:
-                    self.set_state(sid, "skipped", reason=f"{broken[0]} failed")
-                elif stopped:
-                    continue  # on_fail = "stop": steps that don't depend on it stay pending
-                elif plan.reasons[sid] is None:
-                    done = {k: plan.entry(sid).get(k) for k in ("last_run_at", "last_run_id")}
-                    self.details[sid] = {"step": sid, "state": "cached", **done}
-                    self.set_state(sid, "cached", last_run_at=done["last_run_at"])
-                else:
-                    stopped = self.run_step(step) == "stopped"
+            try:
+                self.schedule()
+            finally:  # interrupted: stop the commands still running and wait for them
+                self.cancel.set()
+                for thread in self.threads:
+                    thread.join()
         except KeyboardInterrupt:
             code = INTERRUPTED
         finally:
@@ -253,11 +253,59 @@ class Execution:
             self.view.stop()
         return RunResult(code, plan, self.run_id, self.run_dir, self.live, self.failures)
 
+    def schedule(self) -> None:
+        """Start every step whose required steps have finished, then wait for one to finish and
+        look again, until nothing runs."""
+        plan, waiting, running, stopped = self.plan, list(self.plan.selected), 0, False
+        while True:
+            for sid in list(waiting):  # in dependency order, so one pass settles a chain
+                step = plan.pipe.steps[sid]
+                states = [self.live[n]["state"] for n in step.requires  # steps outside this
+                          if n in self.live]                            # run succeeded before
+                broken = [n for n in step.requires
+                          if self.live.get(n, {}).get("state") in ("failed", "skipped")]
+                if broken:
+                    self.set_state(sid, "skipped", reason=f"{broken[0]} failed")
+                elif stopped or "pending" in states or "running" in states:
+                    continue  # on_fail = "stop": steps that haven't started stay pending
+                elif plan.reasons[sid] is None:
+                    done = {k: plan.entry(sid).get(k) for k in ("last_run_at", "last_run_id")}
+                    self.details[sid] = {"step": sid, "state": "cached", **done}
+                    self.set_state(sid, "cached", last_run_at=done["last_run_at"])
+                else:
+                    self.start(step)
+                    running += 1
+                waiting.remove(sid)
+            if not running:
+                return
+            result = self.finished.get()
+            running -= 1
+            if isinstance(result, BaseException):
+                raise result
+            stopped = stopped or result == "stopped"
+
+    def start(self, step: Step) -> None:
+        """Run the step in a thread; its on_fail outcome, or an error, goes to self.finished."""
+        def work() -> None:
+            result: str | BaseException | None
+            try:
+                result = self.run_step(step)
+            except KeyboardInterrupt:  # self.cancel interrupted its command
+                result = "stopped"
+            except BaseException as e:  # a bug in stepix: the main thread raises it
+                result = e
+            self.finished.put(result)
+
+        thread = threading.Thread(target=work, name=f"stepix-{step.id}")
+        self.threads.append(thread)
+        thread.start()
+
     def run_step(self, step: Step) -> str | None:
         """Run one step's command. Returns the on_fail outcome, if it failed."""
         sid, plan, root = step.id, self.plan, self.root
-        entry = plan.pstate["steps"].setdefault(sid, {})
-        entry["last_state"] = "running"
+        with self.lock:
+            entry = plan.pstate["steps"].setdefault(sid, {})
+            entry["last_state"] = "running"
         started, t0 = now(), time.time()
         self.set_state(sid, "running", started_at=started, reason=plan.reasons[sid])
         outputs = {n: plan.entry(n).get("outputs") or {} for n in plan.pipe.ancestors(sid)}
@@ -300,7 +348,7 @@ class Execution:
                         if attempts > 1:
                             emit(f"[stepix] retry {attempts - 1} of {step.retries}")
                             emitted.clear()
-                        rc = stream(argv, root, env, on_line)
+                        rc = stream(argv, root, env, on_line, stop=self.cancel)
                         if rc == 0:
                             break
                     error = "exit_code" if rc else None
@@ -308,23 +356,24 @@ class Execution:
                 ended = now()
                 warn = step.on_fail == "warn" and error not in (None, "interrupted")
                 state = "done" if error is None else "warned" if warn else "failed"
-                entry.update(last_state=state, last_run_at=ended, last_run_id=self.run_id)
-                if state != "failed":
-                    entry["outputs"] = emitted
-                if state == "done":
-                    entry["params"] = used_params(step, plan.params)
                 outcome = None if error is None else "stopped" if error == "interrupted" else {
                     "stop": "stopped", "continue": "continued", "warn": "warned"}[step.on_fail]
                 timing = {"started_at": started, "ended_at": ended,
                           "duration_s": round(time.time() - t0, 3), "exit_code": rc}
-                self.details[sid] = {"step": sid, "state": state, "reason": plan.reasons[sid],
-                                     "command": cmd, "env": step.env, **timing,
-                                     "attempts": attempts, "outputs": emitted,
-                                     "log": _rel(self.run_dir, log_path)}
-                if error:
-                    self.failures.append(self.summary(step, state, rc, error, cmd, problems,
-                                                      log_path))
-                self.set_state(sid, state, **timing)
+                with self.lock:
+                    entry.update(last_state=state, last_run_at=ended, last_run_id=self.run_id)
+                    if state != "failed":
+                        entry["outputs"] = emitted
+                    if state == "done":
+                        entry["params"] = used_params(step, plan.params)
+                    self.details[sid] = {"step": sid, "state": state,
+                                         "reason": plan.reasons[sid], "command": cmd,
+                                         "env": step.env, **timing, "attempts": attempts,
+                                         "outputs": emitted, "log": _rel(self.run_dir, log_path)}
+                    if error:
+                        self.failures.append(self.summary(step, state, rc, error, cmd, problems,
+                                                          log_path))
+                    self.set_state(sid, state, **timing)
         return outcome
 
     def summary(self, step: Step, state: str, rc: int | None, error: str, cmd: str,

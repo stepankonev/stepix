@@ -21,7 +21,7 @@ CHAIN = pipeline("Chain", step("a"), step("d"), step("b", requires=("a",)),
 def test_caching_and_reruns(project):
     project.write("README.md", CHAIN)
     first = project.stepix("run")
-    assert first.code == 0 and project.ran() == ["a", "d", "b", "c"]
+    assert first.code == 0 and project.ran() == ["a", "b", "c", "d"]
     assert re.search(r"\[stepix\] logs: \.stepix/runs/[\w-]+/logs/<step>\.log\n", first.out)
     again = project.stepix("run")
     assert again.code == 0 and project.ran() == [] and set(again.steps.values()) == {"cached"}
@@ -33,15 +33,15 @@ def test_step_from_and_no_cache(project):
     project.write("README.md", CHAIN)
     early = project.stepix("run", "--step", "b")
     assert early.code == 2 and "'b' requires 'a', which hasn't succeeded yet" in early.out
-    assert project.stepix("run").code == 0 and project.ran() == ["a", "d", "b", "c"]
+    assert project.stepix("run").code == 0 and project.ran() == ["a", "b", "c", "d"]
     only_b = project.stepix("run", "--step", "b")  # chooses b; b is cached, so nothing runs
     assert only_b.code == 0 and project.ran() == [] and only_b.steps == {"b": "cached"}
     assert project.stepix("run", "--step", "b", "--no-cache").code == 0 and project.ran() == ["b"]
     assert project.stepix("run", "--from", "d").code == 0 and project.ran() == []
     assert project.stepix("run", "--from", "d", "--no-cache").code == 0
-    assert project.ran() == ["d", "b", "c"]
+    assert project.ran() == ["b", "c", "d"]
     fresh = project.stepix("run", "--no-cache")
-    assert fresh.code == 0 and project.ran() == ["a", "d", "b", "c"]
+    assert fresh.code == 0 and project.ran() == ["a", "b", "c", "d"]
     assert {s["reason"] for s in fresh.receipt["steps"]} == {"--no-cache"}
     assert "'nope' is not a step" in project.stepix("run", "--step", "nope").out
     assert project.stepix("run", "--step", "a", "--from", "b").code == 2
@@ -54,11 +54,11 @@ def test_changed_params_and_uncached_steps(project):
         step("dice", requires=("use",), cache=False),  # no `cache`: runs every time
         params='url = "a"\nmode = "m"'))
     assert project.stepix("run").code == 0
-    assert project.ran() == ["fetch-a", "use", "other-m", "dice"]
+    assert project.ran() == ["dice", "fetch-a", "other-m", "use"]
     assert project.stepix("run").code == 0 and project.ran() == ["dice"]
     readme.write_text(readme.read_text().replace('url = "a"', 'url = "b"'))  # edited
     res = project.stepix("run")
-    assert project.ran() == ["fetch-b", "use", "dice"]  # fetch and what comes after it
+    assert project.ran() == ["dice", "fetch-b", "use"]  # fetch and what comes after it
     assert res.receipt["steps"][0]["reason"] == "changed: params.url"
 
 
@@ -84,7 +84,7 @@ def test_failure_summary_and_resume(project):
         step("c", requires=("b",))))
     project.write("fail_b", "x")
     res = project.stepix("run")
-    assert res.code == 1 and project.ran() == ["a", "d", "b"]
+    assert res.code == 1 and project.ran() == ["a", "b", "d"]
     assert res.steps == {"a": "done", "d": "done", "b": "failed", "c": "skipped"}
     assert res.receipt["steps"][-1]["reason"] == "b failed"
     for line in ("✗ b failed (exit 2)", "error   ValueError: shard 3", "resume  stepix run\n"):
@@ -92,27 +92,122 @@ def test_failure_summary_and_resume(project):
     from_d = project.stepix("run", "--from", "d")  # d is cached; b failed last time, so it runs
     assert "resume  stepix run --from d\n" in from_d.out and project.ran() == ["b"]
     fresh = project.stepix("run", "--no-cache")  # resume without --no-cache: a and d are done
-    assert "resume  stepix run\n" in fresh.out and project.ran() == ["a", "d", "b"]
+    assert "resume  stepix run\n" in fresh.out and project.ran() == ["a", "b", "d"]
     (project.root / "fail_b").unlink()
     assert project.stepix("run").code == 0 and project.ran() == ["b", "c"]
 
 
 @pytest.mark.parametrize("mode", ["continue", "warn", "stop"])
 def test_on_fail(project, mode):
-    project.write("README.md", pipeline(
+    project.write("README.md", pipeline(  # d runs alongside b and is still running when b fails
         "P", step("a"), step("b", requires=("a",), extra=f'on_fail = "{mode}"'),
-        step("c", requires=("b",)), step("d", requires=("a",))))
+        step("c", requires=("b",)), step("d", requires=("a",), run="sleep 2; echo d >> ran.txt"),
+        step("e", requires=("d",))))
     project.write("fail_b", "x")
     res = project.stepix("run")
     if mode == "continue":
-        assert res.code == 1 and project.ran() == ["a", "b", "d"]
-        assert res.steps == {"a": "done", "b": "failed", "c": "skipped", "d": "done"}
+        assert res.code == 1 and project.ran() == ["a", "b", "d", "e"]
+        assert res.steps == {"a": "done", "b": "failed", "c": "skipped", "d": "done", "e": "done"}
     elif mode == "warn":
-        assert res.code == 0 and project.ran() == ["a", "b", "c", "d"]
+        assert res.code == 0 and project.ran() == ["a", "b", "c", "d", "e"]
         assert res.steps["b"] == "warned"
-    else:
-        assert res.code == 1 and project.ran() == ["a", "b"]
-        assert res.steps == {"a": "done", "b": "failed", "c": "skipped", "d": "pending"}
+    else:  # what runs finishes; nothing new starts
+        assert res.code == 1 and project.ran() == ["a", "b", "d"]
+        assert res.steps == {"a": "done", "b": "failed", "c": "skipped", "d": "done",
+                             "e": "pending"}
+
+
+def meet(me: str, other: str) -> str:
+    """A step's command that passes only if step `other` starts while it runs."""
+    return (f"touch {me}_started; i=0; "
+            f"while [ ! -e {other}_started ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); "
+            f"done; test -e {other}_started && echo ::stepix::output v={me}")
+
+
+def test_steps_that_dont_depend_on_each_other_run_at_the_same_time(project):
+    project.write("README.md", pipeline(
+        "Diamond", step("a"), step("b", requires=("a",), run=meet("b", "c")),
+        step("c", requires=("a",), run=meet("c", "b")),
+        step("d", requires=("b", "c"), run="echo {steps.b.v}{steps.c.v} >> ran.txt")))
+    res = project.stepix("run")
+    assert res.code == 0 and res.steps == dict.fromkeys("abcd", "done")
+    assert project.ran() == ["a", "bc"]  # d got a value from each branch
+    at = {s["step"]: s for s in res.receipt["steps"]}
+    assert at["a"]["ended_at"] <= min(at["b"]["started_at"], at["c"]["started_at"])
+    assert at["d"]["started_at"] >= max(at["b"]["ended_at"], at["c"]["ended_at"])
+
+
+def test_a_step_nothing_connects_to_runs_alongside_the_rest(project):
+    project.write("README.md", pipeline(  # lone requires nothing and nothing requires it
+        "P", step("a", run=meet("a", "lone")), step("b", requires=("a",)),
+        step("lone", run=meet("lone", "a"))))
+    res = project.stepix("run")
+    assert res.code == 0 and res.steps == {"a": "done", "b": "done", "lone": "done"}
+    assert project.ran() == ["b"]
+    project.write("only.md", pipeline("Only", step("lone")))  # a file with a single step
+    res = project.stepix("run", "only.md")
+    assert res.code == 0 and res.steps == {"lone": "done"} and project.ran() == ["lone"]
+
+
+def test_requires_makes_heavy_steps_take_turns(project):
+    # b and c don't need each other; c requires b only so that the two never run at once
+    slow_b = "sleep 1; echo b >> ran.txt; test ! -e fail_b"
+    project.write("README.md", pipeline(
+        "P", step("a"), step("b", requires=("a",), run=slow_b), step("c", requires=("a", "b"))))
+    res = project.stepix("run")
+    at = {s["step"]: s for s in res.receipt["steps"]}
+    assert res.code == 0 and at["c"]["started_at"] >= at["b"]["ended_at"]
+    project.write("fail_b", "x")  # the price: c also waits for b to succeed
+    res = project.stepix("run", "--no-cache")
+    assert res.code == 1 and res.steps == {"a": "done", "b": "failed", "c": "skipped"}
+
+
+def test_a_failed_branch_skips_only_what_depends_on_it(project):
+    # a ─ b ✗ ─ c ─ d ─╮
+    # a ─ e ─── f ─────┴─ g
+    project.write("README.md", pipeline(
+        "P", step("a"), step("b", requires=("a",), extra='on_fail = "continue"'),
+        step("c", requires=("b",)), step("d", requires=("c",)),
+        step("e", requires=("a",), run="sleep 1; echo e >> ran.txt"),
+        step("f", requires=("e",)), step("g", requires=("d", "f"))))
+    project.write("fail_b", "x")
+    res = project.stepix("run")
+    assert res.code == 1 and project.ran() == ["a", "b", "e", "f"]
+    assert res.steps == {"a": "done", "b": "failed", "c": "skipped", "d": "skipped",
+                         "e": "done", "f": "done", "g": "skipped"}
+    reasons = {s["step"]: s.get("reason") for s in res.receipt["steps"]}
+    assert (reasons["c"], reasons["d"], reasons["g"]) == ("b failed", "c failed", "d failed")
+    assert res.out.count("✗ b failed") == 1
+
+
+def test_two_steps_that_fail_at_once_are_both_reported(project):
+    project.write("README.md", pipeline(
+        "P", step("a"), step("b", requires=("a",)), step("c", requires=("a",)),
+        step("d", requires=("b", "c"))))
+    project.write("fail_b", "x")
+    project.write("fail_c", "x")
+    res = project.stepix("run")
+    assert res.code == 1 and project.ran() == ["a", "b", "c"]
+    assert res.steps == {"a": "done", "b": "failed", "c": "failed", "d": "skipped"}
+    assert "✗ b failed (exit 1)" in res.out and "✗ c failed (exit 1)" in res.out
+
+
+def test_many_steps_at_once_keep_state_and_the_receipt_whole(project):
+    names = [f"s{i}" for i in range(12)]
+    steps = [step(n, run=f"echo {n} >> ran.txt; echo ::stepix::output v={n}") for n in names]
+    values = " ".join(f"{{steps.{n}.v}}" for n in names)
+    steps.append(step("join", requires=tuple(names), run=f"echo {values} > joined.txt"))
+    project.write("README.md", pipeline("Wide", *steps))
+    res = project.stepix("run")
+    assert res.code == 0 and set(res.steps.values()) == {"done"} and len(res.steps) == 13
+    assert project.ran() == sorted(names)
+    assert (project.root / "joined.txt").read_text().split() == names
+    state = json.loads((project.root / ".stepix" / "state.json").read_text())
+    saved = state["pipelines"]["README.md"]["steps"]
+    assert all(saved[n]["last_state"] == "done" and saved[n]["outputs"] == {"v": n}
+               for n in names)
+    again = project.stepix("run")  # every step's success was saved, so all are cached
+    assert again.code == 0 and set(again.steps.values()) == {"cached"}
 
 
 def test_retries(project):
@@ -154,23 +249,26 @@ def test_one_run_at_a_time_and_its_files_show_progress(project):
 
 
 def test_a_signal_stops_the_step_and_finalizes_the_run(project):
-    project.write("README.md", pipeline(
-        "P", step("slow", run="touch started; sleep 4; touch survived")))
+    project.write("README.md", pipeline(  # two steps running at once: both stop
+        "P", step("slow", run="touch started; sleep 4; touch survived"),
+        step("slower", run="touch started2; sleep 4; touch survived2"),
+        step("after", requires=("slow",), run="touch survived3")))
     proc = subprocess.Popen([sys.executable, "-m", "stepix", "run"], cwd=project.root,
                             env=project.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
     for _ in range(100):
-        if (project.root / "started").exists():
+        if (project.root / "started").exists() and (project.root / "started2").exists():
             break
         time.sleep(0.1)
     proc.send_signal(signal.SIGTERM)
     proc.communicate(timeout=30)
     assert proc.returncode == 130
     time.sleep(5)
-    assert not (project.root / "survived").exists()
+    assert not any((project.root / f).exists() for f in ("survived", "survived2", "survived3"))
     (manifest,) = project.root.glob(".stepix/runs/*/manifest.json")
     receipt = json.loads(manifest.read_text())
-    assert receipt["status"] == "interrupted" and receipt["steps"][0]["state"] == "failed"
+    assert receipt["status"] == "interrupted"
+    assert [s["state"] for s in receipt["steps"]] == ["failed", "failed", "pending"]
 
 
 def test_background_leftovers_neither_hang_nor_survive(project):

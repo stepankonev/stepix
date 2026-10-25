@@ -148,6 +148,31 @@ def test_references_cycles_and_envs(project):
     assert "envs/unlocked" not in out  # an env needs no uv.lock: uv makes one on first use
 
 
+def test_every_cycle_is_reported_as_requires_reads(project):
+    project.write("README.md", pipeline(
+        "P", step("a"), step("b", requires=("c",)), step("c", requires=("e",)),
+        step("e", requires=("b",)), step("s", requires=("s",)), step("x", requires=("y",)),
+        step("y", requires=("x",))))
+    res = project.stepix("validate")
+    assert res.code == 2 and res.out.count("dependency cycle") == 3
+    for text in ("[steps.b] dependency cycle: b requires c, c requires e, e requires b",
+                 "[steps.s] dependency cycle: s requires itself",
+                 "[steps.x] dependency cycle: x requires y, y requires x"):
+        assert text in res.out, text
+
+
+def test_run_checks_the_whole_graph_before_any_step_runs(project):
+    fine = (step("a"), step("d", requires=("a",)))
+    for broken in ((step("b", requires=("c",)), step("c", requires=("b",))),
+                   (step("b", requires=("b",)),),
+                   (step("b", requires=("nope",)),),
+                   (step("b", run="echo {steps.a.v}"),)):  # uses a's value without requiring a
+        project.write("README.md", pipeline("P", *fine, *broken))
+        res = project.stepix("run")
+        assert res.code == 2 and res.receipt is None and project.ran() == [], broken
+        assert not (project.root / ".stepix").exists()
+
+
 def test_any_markdown_file_and_clear_errors_without_one(project):
     missing = project.stepix("run")
     assert missing.code == 2 and "README.md not found" in missing.out
