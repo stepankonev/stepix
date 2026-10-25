@@ -45,9 +45,11 @@ def child_env(**extra: str) -> dict[str, str]:
     return env
 
 
-def stream(argv: list[str], cwd: Path, env: dict[str, str], on_line: Callable[[str], None]) -> int:
+def stream(argv: list[str], cwd: Path, env: dict[str, str], on_line: Callable[[str], None],
+           stop: threading.Event | None = None) -> int:
     """Run argv with stdin closed and stderr merged into stdout, feeding each line to on_line.
-    Background processes it leaves behind are stopped once it exits."""
+    Background processes it leaves behind are stopped once it exits. When `stop` is set, it is
+    interrupted and KeyboardInterrupt is raised, as on Ctrl+C."""
     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             errors="replace", bufsize=1, start_new_session=True)
@@ -63,6 +65,8 @@ def stream(argv: list[str], cwd: Path, env: dict[str, str], on_line: Callable[[s
     drain_until = None
     try:
         while True:
+            if stop is not None and stop.is_set():
+                raise KeyboardInterrupt
             try:
                 line = lines.get(timeout=0.1)
             except queue.Empty:

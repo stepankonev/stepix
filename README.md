@@ -80,10 +80,14 @@ file).
 | Name | `[steps.NAME]` | yes | — | the step's name: lowercase letters, digits, `_` |
 | Command | `run = "..."` | yes | — | a shell command, run from the README's folder |
 | Environment | `env = "envs/x"` | no | the repo's own | a uv project folder (`pyproject.toml`; a `uv.lock` pins its versions) |
-| Requires | `requires = ["a"]` | no | `[]` | steps that must finish first |
+| Requires | `requires = ["a"]` | no | `[]` | steps that must finish first; the rest run at the same time |
 | Cache | `cache = true` | no | `false` | `true`: skip it once it has succeeded |
 | On failure | `on_fail = "continue"` | no | `"stop"` | `continue`: skip what depends on it; `warn`: carry on |
 | Retries | `retries = 2` | no | `0` | how many more times to try a failed command |
+
+A step starts as soon as the steps it requires have finished, so steps that don't depend on each
+other run in parallel. When one fails with `on_fail = "stop"`, the steps already running finish
+and no new ones start.
 
 In `run`, `{steps.STEP.NAME}` is a value from a step it requires. A step outputs one with
 `output(NAME=value)` in Python (`from stepix import output`), or from any language by printing

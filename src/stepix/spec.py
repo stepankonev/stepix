@@ -229,12 +229,22 @@ def validate(pipe: Pipeline, shown: str) -> list[Problem]:
         errors.append(Problem(kind, message, fix=fix, file=shown, line=line or step.line,
                               heading=f"steps.{step.id}"))
 
-    graph = {s.id: [n for n in s.requires if n in pipe.steps] for s in pipe.steps.values()}
-    try:
-        tuple(TopologicalSorter(graph).static_order())
-    except CycleError as e:
-        cycle = e.args[1]
-        report(pipe.steps[cycle[0]], "cycle", "dependency cycle: " + " -> ".join(cycle))
+    graph = {s.id: list(dict.fromkeys(n for n in s.requires if n in pipe.steps))
+             for s in pipe.steps.values()}
+    order = list(pipe.steps)
+    while True:  # every cycle: report one, break it, look again
+        try:
+            tuple(TopologicalSorter(graph).static_order())
+            break
+        except CycleError as e:
+            loop = e.args[1][::-1][:-1]  # graphlib lists a required step first: flip it
+            first = min(range(len(loop)), key=lambda i: order.index(loop[i]))
+            loop = loop[first:] + loop[:first]  # start at the step that comes first in the file
+            pairs = list(zip(loop, loop[1:] + loop[:1]))
+            report(pipe.steps[loop[0]], "cycle", "dependency cycle: " + ", ".join(
+                f"{a} requires {'itself' if a == b else b}" for a, b in pairs),
+                pipe.steps[loop[0]].lines.get("requires"))
+            graph[loop[0]].remove(pairs[0][1])
     for step in pipe.steps.values():
         for n in step.requires:
             if n not in pipe.steps:

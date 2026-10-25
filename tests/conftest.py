@@ -43,11 +43,12 @@ class Project:
         return path
 
     def ran(self) -> list[str]:
-        """Steps that really executed: test steps append their name to ran.txt."""
+        """Steps that really executed, sorted: test steps append their name to ran.txt, and
+        steps that don't depend on each other run at the same time, in no fixed order."""
         path = self.root / "ran.txt"
         lines = path.read_text().split() if path.exists() else []
         path.unlink(missing_ok=True)
-        return lines
+        return sorted(lines)
 
     def receipts(self) -> set[Path]:
         return set(self.root.glob("**/.stepix/runs/*/manifest.json"))
